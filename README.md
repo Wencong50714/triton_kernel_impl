@@ -14,3 +14,10 @@ In the 2080Ti GPU Platform
 - [ ] TODO: Add More test to measure performance
 
 #### 2D-Convolution
+
+
+## Reference 
+
+https://github.com/srush/Triton-Puzzles
+
+https://github.com/SiriusNEO/Triton-Puzzles-Lite
