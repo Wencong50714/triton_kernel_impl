@@ -13,7 +13,7 @@ def naive_softmax(x: torch.Tensor)-> torch.Tensor:
     return sm_out
 
 @triton.jit
-def _softmax_kernel_optimized(
+def _softmax_kernel_online(
     x_ptr, sm_out, rows, cols, B0: tl.constexpr, B1: tl.constexpr
 ):
     # Program ID and row offsets
@@ -63,7 +63,7 @@ def _softmax_kernel_optimized(
         tl.store(sm_out + off_ij, z, mask)
 
 
-def softmax_optimized(x: torch.Tensor) -> torch.Tensor:
+def online_softmax(x: torch.Tensor) -> torch.Tensor:
     rows, cols = x.shape
     assert x.dim() == 2, f"only accepts 2D tensors for now"
 
@@ -88,11 +88,11 @@ def softmax_optimized(x: torch.Tensor) -> torch.Tensor:
     grid = (triton.cdiv(rows, B0),)
     
     sm_out = torch.empty_like(x)
-    _softmax_kernel_optimized[grid](x, sm_out, rows, cols, B0=B0, B1=B1, num_warps=num_warps)
+    _softmax_kernel_online[grid](x, sm_out, rows, cols, B0=B0, B1=B1, num_warps=num_warps)
     return sm_out
 
 @triton.jit
-def _softmax_fwd_kernel(
+def _softmax_kernel_fused(
     output_ptr,
     stride_output_row,
     input_ptr,
@@ -125,7 +125,7 @@ def _softmax_fwd_kernel(
 
 
 
-def softmax(x:torch.Tensor)->torch.Tensor:
+def fused_softmax(x:torch.Tensor)->torch.Tensor:
     """ Triton impl of Softmax, fwd pass only """
     rows, cols = x.shape
     assert x.dim() ==2, f"only accepts 2D tensors for now"
@@ -141,7 +141,7 @@ def softmax(x:torch.Tensor)->torch.Tensor:
     # allocate our output buffer
     sm_out = torch.empty_like(x)
 
-    _softmax_fwd_kernel[grid](
+    _softmax_kernel_fused[grid](
         sm_out,
         sm_out.stride(0),
         x,
@@ -162,16 +162,16 @@ def softmax(x:torch.Tensor)->torch.Tensor:
         ],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=[
-            'triton',
-            'triton-manual',
-            'torch-function',
-            'torch-native',
+            'fused',
+            'online',
+            'torch',
+            'native',
         ],  # possible values for `line_arg``
         line_names=[
-            "Triton",
-            "Triton (Manual)",
-            "Torch (Function)",
-            "Torch (Native)",
+            "fused (Triton)",
+            "online (Triton)",
+            "torch",
+            "native (torch)",
         ],  # label name for the lines
         styles=[('blue', '-'), ('blue', '--'), ('green', '-'), ('green', '--')],  # line styles
         ylabel="GB/s",  # label name for the y-axis
@@ -180,22 +180,42 @@ def softmax(x:torch.Tensor)->torch.Tensor:
     )
 )
 
+
 def benchmark(M, N, provider):
     x = torch.randn(M, N, device='cuda', dtype=torch.float32)
     quantiles = [0.5, 0.2, 0.8]
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax(x), quantiles=quantiles)
-    if provider == 'triton-manual':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax_optimized(x), quantiles=quantiles)
-    if provider == 'torch-native':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_softmax(x), quantiles=quantiles)
-    if provider == 'torch-function':
+    if provider == 'fused':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: fused_softmax(x), quantiles=quantiles)
+    if provider == 'online':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: online_softmax(x), quantiles=quantiles)
+    if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.softmax(x, axis=-1), quantiles=quantiles)
+    if provider == 'native':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_softmax(x), quantiles=quantiles)
+
 
     gbps = lambda ms: 2 * x.nelement() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
+def memory_scan():
+    M, N = 4096, 1024
+    x = torch.randn(M, N, device='cuda', dtype=torch.float32)
 
+    for name, func in [
+        ("PyTorch softmax", lambda x: torch.softmax(x, dim=-1)),
+        ("Online softmax", online_softmax),
+        ("Fused softmax", fused_softmax),
+        ("Naive softmax", naive_softmax)
+    ]:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+        result = func(x)
+        torch.cuda.synchronize()
+        
+        total_mem = torch.cuda.memory_allocated() / (1024 ** 2)
+        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        print(f"{name}: Current memory: {total_mem:.2f} MB, Peak memory: {peak_mem:.2f} MB")
 
 if __name__ == "__main__":
     # ======== Check Implementation Correctness
@@ -203,10 +223,14 @@ if __name__ == "__main__":
     x = torch.randn(M, N, device='cuda', dtype=torch.float32)
 
     torch_result = torch.softmax(x, dim=-1)
-    optimized_result = softmax_optimized(x)
+    optimized_result = online_softmax(x)
 
     op_correct = torch.allclose(torch_result, optimized_result, rtol=1e-3, atol=1e-3)
     print(f"Optimized Softmax result: {'✅' if op_correct else '❌'}")
 
     if op_correct:
+        print("Running performance benchmark...")
         benchmark.run(show_plots=True, print_data=True, save_path=Path.cwd())
+        
+        print("Running memory usage benchmark...")
+        benchmark_memory.run(show_plots=True, print_data=True, save_path=Path.cwd())
