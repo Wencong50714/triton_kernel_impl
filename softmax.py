@@ -16,53 +16,71 @@ def naive_softmax(x: torch.Tensor) -> torch.Tensor:
 
 @triton.jit
 def _softmax_kernel_online(
-    x_ptr, sm_out, rows, cols, B0: tl.constexpr, B1: tl.constexpr
+    x_ptr, sm_out_ptr, rows, cols, B0: tl.constexpr, B1: tl.constexpr
 ):
     # Program ID and row offsets
-    block_id_i = tl.program_id(0)
+    pid = tl.program_id(0)
+    start_row = pid * B0
+    row_offsets = start_row + tl.arange(0, B0)
+
+    # Use constant for faster log2(e)
     log2_e = 1.44269504
-    off_i = tl.arange(0, B0)[:, None] + block_id_i * B0
 
-    # Use masks consistently for better performance
-    row_mask = off_i < rows
+    # Pre-compute row offsets
+    row_mask = row_offsets < rows
 
-    # Accumulator (only initialize for valid rows)
-    x_max = tl.full((B0,), -float("inf"), dtype=tl.float32)
+    # Initialize with proper masking
+    x_max = tl.where(row_mask, tl.full((B0,), -float("inf"), dtype=tl.float32), 0.0)
     d_i = tl.zeros((B0,), dtype=tl.float32)
 
     # First pass: find max and compute exponential sum
     for j in range(0, cols, B1):
-        off_j = tl.arange(0, B1)[None, :] + j
-        col_mask = off_j < cols
-        mask = row_mask & col_mask
+        # Setup column indices and masks
+        col_offsets = tl.arange(0, B1)
+        col_mask = col_offsets < (cols - j)
 
-        # Compute offsets and load data with mask
-        off_ij = off_i * cols + off_j
-        x = tl.load(x_ptr + off_ij, mask, other=-float("inf"))
+        # Create 2D mask grid
+        mask = row_mask[:, None] & col_mask[None, :]
 
-        # Update max values efficiently
-        cur_max = tl.maximum(x_max, tl.max(x, axis=1))
+        # Compute memory offsets once
+        row_ptrs = x_ptr + row_offsets[:, None] * cols
+        ptrs = row_ptrs + (j + col_offsets[None, :])
 
-        # Scale by the difference in max values
+        # Load data with mask
+        x = tl.load(ptrs, mask=mask, other=-float("inf"))
+
+        # Compute max more efficiently using tl.max
+        row_max = tl.max(x, axis=1)
+        cur_max = tl.maximum(x_max, row_max)
+
+        # Scale using the differing max values
+        scale_factor = tl.exp2(log2_e * (x_max - cur_max))
         x_exp = tl.exp2(log2_e * (x - cur_max[:, None]))
-        d_i = tl.exp2(log2_e * (x_max - cur_max)) * d_i + tl.sum(x_exp, axis=1)
+        d_i = scale_factor * d_i + tl.sum(x_exp, axis=1)
         x_max = cur_max
 
     # Second pass: normalize with the computed values
     for j in range(0, cols, B1):
-        off_j = tl.arange(0, B1)[None, :] + j
-        col_mask = off_j < cols
-        mask = row_mask & col_mask
+        # Set up indices and masks
+        col_offsets = tl.arange(0, B1)
+        col_mask = col_offsets < (cols - j)
+        mask = row_mask[:, None] & col_mask[None, :]
 
-        off_ij = off_i * cols + off_j
-        x = tl.load(x_ptr + off_ij, mask, other=-float("inf"))
+        # Compute memory offsets efficiently
+        row_ptrs = x_ptr + row_offsets[:, None] * cols
+        x_ptrs = row_ptrs + (j + col_offsets[None, :])
 
-        # Compute normalized values
-        x_exp = tl.exp2(log2_e * (x - x_max[:, None]))
-        z = x_exp / d_i[:, None]
+        output_row_ptrs = sm_out_ptr + row_offsets[:, None] * cols
+        output_ptrs = output_row_ptrs + (j + col_offsets[None, :])
 
-        # Store results with proper masking
-        tl.store(sm_out + off_ij, z, mask)
+        # Load values
+        x = tl.load(x_ptrs, mask=mask, other=-float("inf"))
+
+        # Normalize in one step
+        z = tl.exp2(log2_e * (x - x_max[:, None])) / d_i[:, None]
+
+        # Store results
+        tl.store(output_ptrs, z, mask=mask)
 
 
 def online_softmax(x: torch.Tensor) -> torch.Tensor:
@@ -72,26 +90,20 @@ def online_softmax(x: torch.Tensor) -> torch.Tensor:
     # Adjust block sizes based on input dimensions
     # Better to use powers of 2 aligned with GPU architecture
     if cols <= 256:
-        B1 = 256
+        B1 = 128
     elif cols <= 1024:
+        B1 = 256
+    else:
         B1 = 512
-    else:
-        B1 = 1024
-
-    # For row blocks, adapt based on the matrix shape
-    if rows <= 1024:
-        B0 = 64
-    else:
-        B0 = 128
 
     # Optimize number of warps based on block size
     num_warps = 4 if B1 <= 256 else 8 if B1 <= 512 else 16
 
-    grid = (triton.cdiv(rows, B0),)
+    grid = (rows,)
 
     sm_out = torch.empty_like(x)
     _softmax_kernel_online[grid](
-        x, sm_out, rows, cols, B0=B0, B1=B1, num_warps=num_warps
+        x, sm_out, rows, cols, B0=1, B1=B1, num_warps=num_warps
     )
     return sm_out
 
@@ -162,7 +174,7 @@ def fused_softmax(x: torch.Tensor) -> torch.Tensor:
     triton.testing.Benchmark(
         x_names=["N"],  # argument names to use as an x-axis for the plot
         x_vals=[
-            128 * i for i in range(2, 100)
+            1024 * i for i in range(2, 50)
         ],  # different possible values for `x_name`
         line_arg="provider",  # argument name whose value corresponds to a different line in the plot
         line_vals=[
@@ -212,29 +224,6 @@ def benchmark(M, N, provider):
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
-def memory_scan():
-    M, N = 4096, 1024
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
-
-    for name, func in [
-        ("PyTorch softmax", lambda x: torch.softmax(x, dim=-1)),
-        ("Online softmax", online_softmax),
-        ("Fused softmax", fused_softmax),
-        ("Naive softmax", naive_softmax),
-    ]:
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.empty_cache()
-
-        result = func(x)
-        torch.cuda.synchronize()
-
-        total_mem = torch.cuda.memory_allocated() / (1024**2)
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
-        print(
-            f"{name}: Current memory: {total_mem:.2f} MB, Peak memory: {peak_mem:.2f} MB"
-        )
-
-
 if __name__ == "__main__":
     # ======== Check Implementation Correctness
     M, N = 4096, 1024
@@ -249,6 +238,3 @@ if __name__ == "__main__":
     if op_correct:
         print("Running performance benchmark...")
         benchmark.run(show_plots=True, print_data=True, save_path=Path.cwd())
-
-        print("Running memory usage benchmark...")
-        benchmark_memory.run(show_plots=True, print_data=True, save_path=Path.cwd())
